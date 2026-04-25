@@ -105,6 +105,112 @@ go func()
     -> 放入当前 P 的本地 runq
     -> 必要时唤醒或创建 M 执行
 ```
+runtime.newproc & runtime.newproc1是什么
+<details>
+
+`runtime.newproc` 和 `runtime.newproc1` 是 **Go runtime 内部用来创建 goroutine 的函数**，不是你代码里直接调用的函数。
+
+源码在这里：[/usr/local/go/src/runtime/proc.go](/usr/local/go/src/runtime/proc.go:5158)
+
+大致关系是：
+
+```go
+go func() {
+    // ...
+}()
+```
+
+编译器会把这个 `go` 语句转换成类似：
+
+```go
+runtime.newproc(fn)
+```
+
+然后 runtime 负责真正创建 goroutine。
+
+**`runtime.newproc` 是入口函数**
+
+它主要做几件事：
+
+```go
+func newproc(fn *funcval) {
+    gp := getg()              // 当前 goroutine
+    pc := sys.GetCallerPC()   // 创建位置
+    systemstack(func() {
+        newg := newproc1(fn, gp, pc, false, waitReasonZero)
+
+        pp := getg().m.p.ptr()
+        runqput(pp, newg, true)
+
+        if mainStarted {
+            wakep()
+        }
+    })
+}
+```
+
+可以理解为：
+
+```text
+newproc = 创建 goroutine 的外层入口
+```
+
+它会：
+
+1. 获取当前 goroutine，也就是父 goroutine
+2. 切换到系统栈执行
+3. 调用 `newproc1` 真正创建新的 `g`
+4. 把新 `g` 放入当前 `P` 的本地运行队列
+5. 必要时调用 `wakep()` 唤醒/创建 `M` 来执行 goroutine
+
+**`runtime.newproc1` 是真正干活的函数**
+
+`newproc1` 做的是：
+
+```text
+创建并初始化一个新的 runtime.g 对象
+```
+
+也就是你笔记里的：
+
+```text
+创建 g
+```
+
+它会：
+
+1. 从当前 `P` 的空闲 `g` 池里取一个旧的 `g`
+2. 如果没有，就分配一个新的 `g`
+3. 给这个 `g` 分配/准备栈
+4. 设置它的启动函数，也就是 `go func()` 里的函数
+5. 设置调度上下文，比如 `sp`、`pc`
+6. 设置父 goroutine 信息、创建位置、goid
+7. 把状态改成 `_Grunnable`
+
+注意：`newproc1` **只负责创建和初始化 `g`**，它不会自己把 `g` 放进运行队列。源码注释里也写了：调用者负责把新 `g` 加入 scheduler。
+
+所以你的这段可以理解成：
+
+```text
+go func()
+    -> 编译器转成 runtime.newproc(fn)
+    -> newproc 切到系统栈
+    -> 调用 runtime.newproc1 真正创建一个新的 g
+    -> newproc 把 newg 放入当前 P 的本地 runq
+    -> wakep 唤醒 M 来执行
+```
+
+一句话总结：
+
+```text
+newproc 是“创建 goroutine 的入口”
+newproc1 是“实际分配并初始化 g 的底层函数”
+```
+
+</details>
+
+
+这里的 `g` 是 Go runtime 里的 goroutine 结构体，不是操作系统线程。操作系统线程对应的是 `M`，调度资源对应的是 `P`。
 
 Runtime 中核心结构是 GMP：
 
@@ -254,6 +360,194 @@ flowchart LR
     P --> M["M: OS thread"]
     M --> CPU["CPU core"]
 ```
+
+P如何创建以及与G，M的对应关系   
+<details>
+Go runtime 里通常会有多个 `P`。可以这样理解：
+
+```text
+P 的数量 = GOMAXPROCS
+```
+
+比如：
+
+```text
+GOMAXPROCS = 4
+```
+
+runtime 就会创建：
+
+```text
+P0
+P1
+P2
+P3
+```
+
+所以可以看到：
+
+```text
+P0.runq: g1 g2 g3 g4
+P1.runq:
+P2.runq: g5 g6
+P3.runq:
+```
+
+这是因为当前程序有 4 个 `P`。
+
+**为什么要有多个 P？**
+
+因为 Go 要支持 goroutine 并行执行。
+
+在 GMP 模型里：
+
+```text
+G = goroutine
+M = OS thread，操作系统线程
+P = processor，调度上下文
+```
+
+一个 `M` 想执行 Go 代码，必须绑定一个 `P`。
+
+如果只有一个 `P`：
+
+```text
+M0 + P0 -> 执行 goroutine
+```
+
+那同一时刻最多只有一个线程在执行 Go 代码。
+
+如果有多个 `P`：
+
+```text
+M0 + P0 -> 执行 goroutine
+M1 + P1 -> 执行 goroutine
+M2 + P2 -> 执行 goroutine
+M3 + P3 -> 执行 goroutine
+```
+
+那多个 goroutine 就可以真正并行跑在多个 CPU 核心上。
+
+所以，多个 `P` 的意义是：
+
+```text
+控制 Go 代码的并行度
+```
+
+**P 是怎么创建的？**
+
+Go 程序启动时，runtime 会初始化调度器。
+
+源码大概在：
+
+[/usr/local/go/src/runtime/proc.go](/usr/local/go/src/runtime/proc.go:832)
+
+启动时会执行 `schedinit()`，里面会决定 `procs` 的数量：
+
+```go
+if n, ok := strconv.Atoi32(gogetenv("GOMAXPROCS")); ok && n > 0 {
+    procs = n
+} else {
+    procs = defaultGOMAXPROCS(numCPUStartup)
+}
+procresize(procs)
+```
+
+意思是：
+
+1. 如果你设置了环境变量 `GOMAXPROCS`，就用你设置的值
+2. 如果没设置，runtime 会根据机器 CPU 情况决定默认值
+3. 然后调用 `procresize(procs)` 创建对应数量的 `P`
+
+真正创建 `P` 的地方在：
+
+[/usr/local/go/src/runtime/proc.go](/usr/local/go/src/runtime/proc.go:5866)
+
+核心逻辑类似：
+
+```go
+if nprocs > int32(len(allp)) {
+    allp = make([]*p, nprocs)
+}
+
+for i := old; i < nprocs; i++ {
+    pp := allp[i]
+    if pp == nil {
+        pp = new(p)
+    }
+    pp.init(i)
+    allp[i] = pp
+}
+```
+
+也就是说，runtime 内部有一个全局数组/切片：
+
+```go
+allp []*p
+```
+
+如果 `GOMAXPROCS = 4`，那么大概就是：
+
+```text
+allp[0] = P0
+allp[1] = P1
+allp[2] = P2
+allp[3] = P3
+```
+
+**每个 P 为什么有自己的 runq？**
+
+因为如果所有 goroutine 都放进一个全局队列：
+
+```text
+global runq: g1 g2 g3 g4 g5 g6
+```
+
+多个线程同时取任务时，就要频繁抢同一把锁，性能会差。
+
+所以 Go 给每个 `P` 一个本地运行队列：
+
+```text
+P0.runq
+P1.runq
+P2.runq
+P3.runq
+```
+
+这样当前 `P` 创建出来的 goroutine，优先放到自己的本地队列里，减少锁竞争。
+
+不过队列不一定平均，所以可能出现：
+
+```text
+P0.runq: g1 g2 g3 g4
+P1.runq:
+P2.runq: g5 g6
+P3.runq:
+```
+
+这很正常。
+
+如果 `P1` 空了，它不会傻等。它会尝试：
+
+```text
+1. 从全局 runq 拿
+2. 从其他 P 的 runq 偷一部分 goroutine
+3. 查网络轮询器 netpoll
+4. 找定时器任务
+```
+
+这就是 work stealing，工作窃取。
+
+一句话总结：
+
+```text
+P 的数量由 GOMAXPROCS 决定；
+Go 程序启动时 runtime 通过 procresize 创建多个 P；
+多个 P 是为了让多个 M 能并行执行 goroutine；
+每个 P 有自己的本地 runq，是为了减少全局队列锁竞争。
+```
+</details>
+
 
 ### 3.3 常见踩坑与避坑指南
 
