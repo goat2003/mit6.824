@@ -4,6 +4,238 @@
 
 ---
 
+# 前言：了解runtime
+## 1. runtime 是什么
+
+Go 程序不是直接从你的 main.main() 开始跑的。每个 Go 二进制都会打进一套 runtime，它负责：
+
+创建并调度 goroutine
+管理 goroutine 栈
+堆内存分配
+垃圾回收 GC
+channel、mutex、timer、netpoll 的底层协作
+panic/defer/recover
+map、interface、reflect 所需的类型元数据
+syscall/cgo/race detector/profiler/trace 支持
+你写：
+
+go f()
+看起来只是语言语法，底层会变成 runtime 创建一个 G，把它放进调度队列，然后由调度器找线程执行。
+
+## 2. runtime 包的常用 API
+
+常见用法：
+
+runtime.NumCPU()
+runtime.NumGoroutine()
+runtime.GOMAXPROCS(0)
+runtime.Gosched()
+runtime.GC()
+runtime.ReadMemStats(&m)
+runtime.Caller(0)
+runtime.Callers(...)
+runtime.LockOSThread()
+runtime.KeepAlive(x)
+runtime.SetFinalizer(x, f)
+但很多 API 不该滥用：
+
+runtime.GC()：一般不要手动调，除非测试、基准、特殊释放场景。
+runtime.Gosched()：让出当前 P 给别的 goroutine，用得很少。
+SetFinalizer：不要当析构函数用，执行时间不确定。
+LockOSThread：只在 GUI、OpenGL、某些 syscall/cgo 需要固定 OS 线程时用。
+KeepAlive：防止对象被编译器/GC 过早认为不可达，常见于 fd、unsafe、syscall 场景。
+运行时环境变量也很重要：
+
+GOMAXPROCS=8
+GOGC=100
+GOMEMLIMIT=2GiB
+GODEBUG=gctrace=1,schedtrace=1000
+GOTRACEBACK=all
+## 3. 启动流程
+
+粗略流程是：
+
+OS 启动进程
+-> runtime 的汇编入口 rt0
+-> 初始化 TLS / g0 / m0
+-> osinit
+-> schedinit
+-> mallocinit
+-> gcinit
+-> 创建 main goroutine
+-> 执行所有 package init
+-> 调用 main.main
+所以 main.main() 之前，调度器、内存分配器、GC、系统监控线程基本都已经准备好了。
+
+## 4. GMP 调度模型
+
+Go 调度器核心是 GMP：
+
+G = goroutine，用户态执行单元
+M = machine，OS 线程
+P = processor，执行 Go 代码所需的逻辑处理器
+关系：
+
+M 必须拿到 P 才能执行 Go 代码
+P 有本地 run queue
+G 会在 P 的队列、全局队列、netpoll、timer、GC worker 之间流转
+go f() 大致发生：
+
+newproc 创建 G
+-> 放入当前 P 的本地队列
+-> 必要时 wakep 唤醒/创建 M
+-> M 绑定 P
+-> schedule 找到可运行 G
+-> 执行 f
+调度器找活干的顺序大致是：
+
+当前 P 的 runnext
+-> 当前 P 的本地队列
+-> 全局队列
+-> netpoll 就绪事件
+-> timer
+-> 从其他 P 偷一半任务
+-> 停车休眠
+这就是为什么 goroutine 很便宜：它不是 OS 线程。大量 goroutine 可以复用少量 OS 线程。
+
+## 5. 阻塞与抢占
+
+如果 goroutine 做网络 I/O，Go 通常把 fd 设置成非阻塞，然后 goroutine park 到 netpoller，线程不会傻等。
+
+如果 goroutine 进入阻塞 syscall：
+
+G 进入 _Gsyscall
+M 可能阻塞在内核
+P 被释放给其他 M
+其他 goroutine 继续跑
+如果是 CPU 死循环，runtime 依赖安全点和异步抢占把它停下来，避免一个 goroutine 长时间霸占 P。底层有 sysmon 系统监控 goroutine，负责抢占、timer、netpoll、GC 辅助等维护工作。
+
+## 6. 栈管理
+
+每个 goroutine 有自己的栈，但不是 OS 线程那种几 MB 固定栈。Go 栈很小起步，按需增长。
+
+函数入口附近有栈空间检查：
+
+栈够 -> 继续执行
+栈不够 -> morestack
+-> 分配更大栈
+-> 拷贝旧栈
+-> 修正指针
+-> 继续执行
+runtime 里还有特殊的 g0 栈。调度、GC、栈扩容等 runtime 内部逻辑通常切到系统栈上执行，避免在普通 goroutine 栈上递归触发更多栈扩容。
+
+## 7. 内存分配
+
+Go 先由编译器做逃逸分析：
+
+x := T{}
+如果对象不逃逸，可能放栈上；逃逸了才进堆。
+
+堆分配核心函数是 mallocgc。分配器结构大致是：
+
+mcache   每个 P 的本地缓存，无锁快路径
+mcentral 每种 size class 的 span 池
+mheap    全局页堆
+mspan    一段连续页，切成同尺寸对象
+OS       VirtualAlloc / mmap 等系统内存
+小对象通常走：
+
+size class
+-> 当前 P 的 mcache
+-> 当前 mspan 找空位
+-> 没有空位就找 mcentral
+-> 再没有找 mheap
+-> 再没有向 OS 要内存
+大对象绕过 mcache/mcentral，直接从 mheap 分配。
+
+Go 的小对象上限通常是 32KB 左右。你本机 Windows/amd64 的源码里，heap arena 尺寸比 Linux/macOS 小，Windows 64 位是 4MB arena，这是为了避免 Windows 提交内存成本过高。
+
+## 8. GC 原理
+
+Go 当前 GC 是：
+
+并发
+三色标记
+精确 GC
+非分代
+非压缩
+mark-sweep
+核心阶段：
+
+1. sweep termination：短 STW，结束上一轮清扫
+2. mark setup：短 STW，打开写屏障
+3. concurrent mark：并发标记，扫描栈、全局变量、堆对象
+4. mark termination：短 STW，完成标记
+5. concurrent sweep：并发清扫未使用对象
+三色模型：
+
+白色：还没确认存活，最后可能回收
+灰色：确认存活，但它引用的对象还没扫完
+黑色：确认存活，引用也处理完
+写屏障的作用是：GC 并发标记时，用户 goroutine 还在改指针。如果没有屏障，GC 可能漏标对象。编译器会在指针写入处插入 runtime write barrier。
+
+GOGC=100 的直觉是：上一轮 GC 后如果 live heap 是 100MB，那么大约再分配 100MB 后触发下一轮。官方 GC guide 里更精确的公式还会把 GC roots 算进去：
+
+Target heap = Live heap + (Live heap + GC roots) * GOGC / 100
+GOMEMLIMIT 是软内存上限，runtime 会用它调整 GC 频率和归还 OS 内存的行为。
+
+## 9. channel / mutex 底层
+
+channel 底层是 hchan，核心有：
+
+环形缓冲区
+send 等待队列
+recv 等待队列
+互斥锁
+元素类型信息
+发送时：
+
+有接收者等待 -> 直接拷贝给接收者，唤醒它
+有 buffer 空位 -> 放 buffer
+都不行 -> 当前 G park 到 sendq
+接收类似。park/unpark 不是 OS 线程阻塞，而是 G 状态切换，交给调度器。
+
+sync.Mutex 快路径是 atomic CAS；竞争严重时走 runtime semaphore，把 goroutine park，避免一直烧 CPU。
+
+## 10. race detector 和可能遇到的报错
+
+go run -race 会插桩读写内存，依赖 runtime/race。Windows 下它需要 cgo，所以必须有 C 编译器。你刚才遇到的：
+
+cgo: C compiler "gcc" not found
+就是 runtime/cgo 需要 gcc，不是业务代码问题。装好 MSYS2 GCC 后，race detector 才能真正运行并报告数据竞争。
+
+## 11. 最底层关键结构
+
+runtime 源码里最重要的结构大概是：
+
+g       goroutine，含栈、状态、调度现场
+m       OS thread，含 g0、当前运行的 G、绑定的 P
+p       processor，含本地 runq、mcache、timer、GC work buffer
+schedt  全局调度器状态
+mspan   一段堆页
+mcache  P 本地小对象缓存
+mcentral size class 级别 span 池
+mheap   全局堆
+调度切换不是普通函数调用，而是保存寄存器现场，切到 g0，再恢复另一个 G 的现场。runtime 里大量 //go:nosplit、//go:systemstack、汇编、原子操作，就是为了在“不能分配、不能增长栈、不能被抢占”的底层路径里保持正确性。
+
+## 12. 实用心法
+
+写 Go 时你大多数时候不需要直接碰 runtime。你真正需要记住的是：
+
+goroutine 便宜，但不是免费
+共享变量必须用 channel / mutex / atomic 同步
+不要靠 sleep 等并发结果
+减少无意义堆分配比手动 runtime.GC 更重要
+先 pprof/trace，再调 GOGC/GOMEMLIMIT
+finalizer 不是可靠资源释放机制
+阻塞网络 I/O 通常没问题，阻塞 cgo/syscall 要小心
+你可以重点读这几个本机源码入口：
+
+C:/Users/Genius/sdk/go1.26.2/go/src/runtime/proc.go：GMP 调度器
+C:/Users/Genius/sdk/go1.26.2/go/src/runtime/malloc.go：内存分配器
+C:/Users/Genius/sdk/go1.26.2/go/src/runtime/mgc.go：GC 主流程
+
+
 # 第一篇：Goroutine 深度解剖
 
 ## 1. 并发、并行与 Goroutine

@@ -27,7 +27,7 @@ func main() {
 		}()
 	}
 
-	for count<5 && finished!=10{
+	for count<5 && finished!=10{      //空循环等待其他线程结果，会造成cpu的浪费，增加sleep时间可以减少cpu的浪费，但对于sleep的时间又不好把握
 		//wait
 	}
 	if count>=5{
