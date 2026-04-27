@@ -30,7 +30,7 @@ func Serial(url string, fetcher Fetcher, fetched map[string]bool) {
 	}
 }
 
-// 用mutex锁保护共享map的并行爬取
+// 用mutex锁保护共享map,计数器维护等待任务的并行爬取
 func ConcurrentMutex(url string, fetcher Fetcher, fetched map[string]bool, mu *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()   //表示执行完了一个任务，等待任务数-1
 
